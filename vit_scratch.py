@@ -2,7 +2,6 @@
 # https://www.youtube.com/watch?v=ovB0ddFtzzA
 
 
-import einops
 import torch
 import torch.nn as nn
 from torchinfo import summary
@@ -67,7 +66,10 @@ class PatchEmbed(nn.Module):
         """
         x = self.proj(x)  # (n_samples, embed_dim, n_patches**0.5, n_patches**0.5)
 
-        x = einops.rearrange(x, "b e h w-> b (h w) e")  # (n_samples, n_patches, embed_dim)
+        n_samples, _, _, _ = x.shape
+        x = x.view(n_samples, self.embed_dim, -1).transpose(
+            1, 2
+        )  # (n_samples, n_patches, embed_dim)
         return x
 
 
@@ -104,19 +106,30 @@ class Attention(nn.Module):
         Dropout layers.
     """
 
-    def __init__(self, dim, n_heads=12, qkv_bias=True, attn_p=0.0, proj_p=0.0):
+    def __init__(
+        self,
+        dim: int,
+        n_heads: int = 8,
+        qkv_bias: bool = False,
+        qk_norm: bool = False,
+        attn_p: float = 0.0,
+        proj_p: float = 0.0,
+        norm_layer: nn.Module = nn.LayerNorm,
+    ) -> None:
         super().__init__()
+        assert dim % n_heads == 0, "dim should be divisible by n_heads"
         self.n_heads = n_heads
-        self.dim = dim
         self.head_dim = dim // n_heads
-        self.scale = self.head_dim**-0.5  # Normalizing constant for the dot product.
+        self.scale = self.head_dim**-0.5
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_p)
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.attn_p = nn.Dropout(attn_p)
         self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_p)
+        self.proj_p = nn.Dropout(proj_p)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Run forward pass.
 
@@ -130,39 +143,21 @@ class Attention(nn.Module):
         torch.Tensor
             Shape `(n_samples, n_patches + 1, dim)`.
         """
-        n_samples, _, dim = x.shape
-        # n_tokens = n_patch + 1 for the extra token associate with CLS token
+        b, n, c = x.shape
+        qkv = self.qkv(x).reshape(b, n, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        q, k = self.q_norm(q), self.k_norm(k)
 
-        assert dim == self.dim  # Check that the input dimension is correct.
+        q = q * self.scale
+        attn = q @ k.transpose(-2, -1)
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_p(attn)
+        x = attn @ v
 
-        qkv = self.qkv(x)  # (n_samples, n_tokens, dim*3)
-
-        qkv = einops.rearrange(
-            qkv,
-            "n_samples n_tokens (qkv_cnt heads head_dim) -> qkv_cnt n_samples heads n_tokens head_dim",
-            qkv_cnt=3,
-            heads=self.n_heads,
-            head_dim=self.head_dim,
-        )
-
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        # q : n_samples, n_heads, n_patches+1, head_dim
-        # k : n_samples, n_heads, n_patches+1, head_dim
-        # v : n_samples, n_heads, n_patches+1, head_dim
-        dp = torch.einsum("bhqe,bhke->bhqk", [q, k]) / self.head_dim**0.5
-        # dp : n_samples, n_heads, n_patches+1, n_patches+1
-        attn = torch.softmax(dp, dim=-1)
-        # attn : n_samples, n_heads, n_patches+1, n_patches+1
-
-        attn = self.attn_drop(attn)
-        # attn : n_samples, n_heads, n_patches+1, n_patches+1
-
-        weighted_avg = torch.einsum("bhqk,bhke->bqhe", [attn, v])
-        # weighted_avg : n_samples, n_patches+1, n_heads, head_dim
-        weighted_avg = einops.rearrange(weighted_avg, "b q h e -> b q (h e)")
-        # weighted_avg : n_samples, n_patches+1, dim
-
-        return self.proj_drop(self.proj(weighted_avg))
+        x = x.transpose(1, 2).reshape(b, n, c)
+        x = self.proj(x)
+        x = self.proj_p(x)
+        return x
 
 
 class _Mlp(nn.Module):
@@ -401,9 +396,7 @@ class VisionTransformer(nn.Module):
         x = self.patch_embed(x)  # (n_samples, n_patches, embed_dim)
 
         print(x.shape)
-        cls_tokens = einops.repeat(
-            self.cls_token, " h w e -> n (h w) e", n=n_samples
-        )  # (n_samples, 1, embed_dim)
+        cls_tokens = self.cls_token.expand(n_samples, -1, -1)  # (n_samples, 1, embed_dim)
 
         x = torch.cat([cls_tokens, x], 1)  # (n_samples, n_patches, embed_dim)
 
